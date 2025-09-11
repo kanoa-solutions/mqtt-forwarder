@@ -124,7 +124,7 @@ client.on('message', async (topic, message) => {
     return;
   }
 
-  // Accept simplified JSON for testing: { beacon_mac, temperature_c|temperature|temp_c, battery_mv|battery?, ts? }
+  // Accept simplified JSON for testing: { beacon_mac, temperature_c|temperature|temp_c, battery_mv|battery?, ts?, pdv_id? }
   if (json?.beacon_mac) {
     const temperature =
       typeof json.temperature_c === 'number' ? json.temperature_c :
@@ -137,7 +137,8 @@ client.on('message', async (topic, message) => {
         temperature,
         battery: typeof json.battery_mv === 'number' ? json.battery_mv : (typeof json.battery === 'number' ? json.battery : 0),
         gateway_mac: gwMac,
-        ts: json.ts
+        ts: json.ts,
+        pdv_id: json.pdv_id,
       };
       await forwardToSupabase(body);
       log.info({ gwMac }, 'Forwarded simplified reading to Supabase');
