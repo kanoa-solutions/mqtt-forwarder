@@ -17,7 +17,11 @@ const {
   LOG_LEVEL = 'info',
 } = process.env;
 
-const log = pino({ level: LOG_LEVEL });
+// Robust log level handling with fallback to 'info'
+const VALID_LEVELS = new Set(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']);
+const configuredLevel = String(LOG_LEVEL || 'info').toLowerCase();
+const resolvedLevel = VALID_LEVELS.has(configuredLevel) ? configuredLevel : 'info';
+const log = pino({ level: resolvedLevel });
 
 if (!MQTT_HOST || !MQTT_USERNAME || !MQTT_PASSWORD || !SUPABASE_FUNCTION_URL || !SUPABASE_AUTH) {
   log.fatal('Missing required environment variables.');
@@ -33,7 +37,8 @@ const client = mqtt.connect(mqttUrl, {
   password: MQTT_PASSWORD,
   protocol: 'mqtts',
   reconnectPeriod: 2000,
-  clean: true
+  clean: true,
+  keepalive: 60,
 });
 
 client.on('connect', () => {
@@ -49,6 +54,8 @@ client.on('connect', () => {
 
 client.on('reconnect', () => log.warn('MQTT reconnecting'));
 client.on('close', () => log.warn('MQTT connection closed'));
+client.on('offline', () => log.warn('MQTT offline'));
+client.on('end', () => log.warn('MQTT end'));
 client.on('error', (err) => log.error({ err }, 'MQTT error'));
 
 // Extract gateway MAC from topic "GwData/<GatewayMAC>"
@@ -102,6 +109,11 @@ async function forwardToSupabase(payload) {
 }
 
 client.on('message', async (topic, message) => {
+  // Always log message receipt at debug level
+  try {
+    log.debug({ topic, length: message ? message.length : 0 }, 'Message received');
+  } catch (_) {}
+
   const gwMac = extractGatewayMac(topic);
 
   let json;
@@ -112,7 +124,31 @@ client.on('message', async (topic, message) => {
     return;
   }
 
-  if (json?.pkt_type !== 'scan_report' || !json?.data?.dev_infos || !Array.isArray(json.data.dev_infos)) {
+  // Accept simplified JSON for testing: { beacon_mac, temperature_c|temperature|temp_c, battery_mv|battery?, ts? }
+  if (json?.beacon_mac) {
+    const temperature =
+      typeof json.temperature_c === 'number' ? json.temperature_c :
+      typeof json.temperature === 'number' ? json.temperature :
+      typeof json.temp_c === 'number' ? json.temp_c : undefined;
+
+    if (typeof temperature === 'number') {
+      const body = {
+        mac_address: json.beacon_mac,
+        temperature,
+        battery: typeof json.battery_mv === 'number' ? json.battery_mv : (typeof json.battery === 'number' ? json.battery : 0),
+        gateway_mac: gwMac,
+        ts: json.ts
+      };
+      await forwardToSupabase(body);
+      log.info({ gwMac }, 'Forwarded simplified reading to Supabase');
+    } else {
+      log.debug({ json }, 'Simplified payload missing numeric temperature');
+    }
+    return;
+  }
+
+  if (json?.pkt_type !== 'scan_report' || !json?.data?.dev_infos || !Array.isArray(json.data.dev_infos)) 
+{
     return; // ignore non-scan-report messages
   }
 
