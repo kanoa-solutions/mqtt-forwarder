@@ -15,7 +15,7 @@ const {
   SUPABASE_FUNCTION_URL,
   SUPABASE_AUTH,
   LOG_LEVEL = 'info',
-  BEACON_WHITELIST, // comma-separated normalized MACs (lowercase, no colons)
+  BEACON_WHITELIST, // optional bootstrap list (comma-separated normalized MACs)
 } = process.env;
 
 // Robust log level handling with fallback to 'info'
@@ -29,19 +29,57 @@ if (!MQTT_HOST || !MQTT_USERNAME || !MQTT_PASSWORD || !SUPABASE_FUNCTION_URL || 
   process.exit(1);
 }
 
-// Normalization and whitelist helpers
+// Normalization and allowlist helpers
 const normalizeMac = (mac) => String(mac || '').toLowerCase().replace(/:/g, '');
-const whitelistSet = new Set(
+const envWhitelist = new Set(
   String(BEACON_WHITELIST || '')
     .split(',')
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean)
 );
-function shouldForwardMac(rawMac) {
-  if (!rawMac) return false;
-  if (whitelistSet.size === 0) return true; // no whitelist configured -> allow all
-  return whitelistSet.has(normalizeMac(rawMac));
+let allowlistSet = new Set(envWhitelist); // will be replaced by DB sync when available
+
+// Derive Supabase REST base from the Edge Function URL
+const REST_BASE = (() => {
+  try {
+    const i = SUPABASE_FUNCTION_URL.indexOf('/functions/');
+    if (i > 0) return SUPABASE_FUNCTION_URL.slice(0, i) + '/rest/v1';
+  } catch (_) {}
+  return null;
+})();
+
+async function syncAllowlistFromDB() {
+  if (!REST_BASE) return;
+  try {
+    const res = await axios.get(`${REST_BASE}/beacons?select=normalized_mac,is_active`, {
+      headers: {
+        apikey: SUPABASE_AUTH,
+        Authorization: `Bearer ${SUPABASE_AUTH}`,
+      },
+      timeout: 5000,
+    });
+    const rows = Array.isArray(res.data) ? res.data : [];
+    const next = new Set(rows.filter(r => r.is_active !== false).map(r => String(r.normalized_mac || '').toLowerCase()).filter(Boolean));
+    // Merge in any env whitelist entries
+    for (const m of envWhitelist) next.add(m);
+    allowlistSet = next;
+    log.info({ size: allowlistSet.size }, 'Synced beacon allowlist from DB');
+  } catch (err) {
+    log.warn({ err: err.response?.data || err.message }, 'Allowlist sync failed; keeping previous set');
+  }
 }
+
+function shouldForwardMac(rawMac) {
+  const norm = normalizeMac(rawMac);
+  if (allowlistSet.size === 0) return true; // fail-open until first sync
+  return allowlistSet.has(norm);
+}
+
+// Initial sync and periodic refresh
+(async () => {
+  await syncAllowlistFromDB();
+  setInterval(syncAllowlistFromDB, 60_000);
+})();
 
 // Build MQTT URL (TLS)
 const mqttUrl = `mqtts://${MQTT_HOST}:${MQTT_PORT}`;
@@ -63,8 +101,8 @@ client.on('connect', () => {
       log.error({ err }, 'Subscribe error');
     } else {
       log.info({ topic: MQTT_TOPIC }, 'Subscribed');
-      if (whitelistSet.size > 0) {
-        log.info({ size: whitelistSet.size, list: Array.from(whitelistSet) }, 'Beacon whitelist active');
+      if (allowlistSet.size > 0) {
+        log.info({ size: allowlistSet.size }, 'Beacon allowlist active');
       }
     }
   });
@@ -122,7 +160,13 @@ async function forwardToSupabase(payload) {
       log.warn({ status: res.status, data: res.data }, 'Supabase non-200 response');
     }
   } catch (err) {
-    log.error({ err: err.response?.data || err.message }, 'Supabase POST error');
+    const data = err.response?.data;
+    // Downgrade noise for unknown beacons
+    if (data && (data.error === 'Beacon not registered' || err.response?.status === 404)) {
+      log.debug({ err: data }, 'Ignored unregistered beacon');
+      return;
+    }
+    log.error({ err: data || err.message }, 'Supabase POST error');
   }
 }
 
@@ -145,7 +189,7 @@ client.on('message', async (topic, message) => {
   // Accept simplified JSON for testing: { beacon_mac, temperature_c|temperature|temp_c, battery_mv|battery?, ts?, pdv_id? }
   if (json?.beacon_mac) {
     if (!shouldForwardMac(json.beacon_mac)) {
-      log.debug({ mac: json.beacon_mac }, 'Skipped (not in whitelist)');
+      log.debug({ mac: json.beacon_mac }, 'Skipped (not in allowlist)');
       return;
     }
 
@@ -186,7 +230,7 @@ client.on('message', async (topic, message) => {
 
     if (!mac) continue;
     if (!shouldForwardMac(mac)) {
-      log.debug({ mac }, 'Skipped (not in whitelist)');
+      log.debug({ mac }, 'Skipped (not in allowlist)');
       continue;
     }
 
