@@ -15,6 +15,7 @@ const {
   SUPABASE_FUNCTION_URL,
   SUPABASE_AUTH,
   LOG_LEVEL = 'info',
+  BEACON_WHITELIST, // comma-separated normalized MACs (lowercase, no colons)
 } = process.env;
 
 // Robust log level handling with fallback to 'info'
@@ -26,6 +27,20 @@ const log = pino({ level: resolvedLevel });
 if (!MQTT_HOST || !MQTT_USERNAME || !MQTT_PASSWORD || !SUPABASE_FUNCTION_URL || !SUPABASE_AUTH) {
   log.fatal('Missing required environment variables.');
   process.exit(1);
+}
+
+// Normalization and whitelist helpers
+const normalizeMac = (mac) => String(mac || '').toLowerCase().replace(/:/g, '');
+const whitelistSet = new Set(
+  String(BEACON_WHITELIST || '')
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean)
+);
+function shouldForwardMac(rawMac) {
+  if (!rawMac) return false;
+  if (whitelistSet.size === 0) return true; // no whitelist configured -> allow all
+  return whitelistSet.has(normalizeMac(rawMac));
 }
 
 // Build MQTT URL (TLS)
@@ -48,6 +63,9 @@ client.on('connect', () => {
       log.error({ err }, 'Subscribe error');
     } else {
       log.info({ topic: MQTT_TOPIC }, 'Subscribed');
+      if (whitelistSet.size > 0) {
+        log.info({ size: whitelistSet.size, list: Array.from(whitelistSet) }, 'Beacon whitelist active');
+      }
     }
   });
 });
@@ -126,6 +144,11 @@ client.on('message', async (topic, message) => {
 
   // Accept simplified JSON for testing: { beacon_mac, temperature_c|temperature|temp_c, battery_mv|battery?, ts?, pdv_id? }
   if (json?.beacon_mac) {
+    if (!shouldForwardMac(json.beacon_mac)) {
+      log.debug({ mac: json.beacon_mac }, 'Skipped (not in whitelist)');
+      return;
+    }
+
     const temperature =
       typeof json.temperature_c === 'number' ? json.temperature_c :
       typeof json.temperature === 'number' ? json.temperature :
@@ -149,7 +172,7 @@ client.on('message', async (topic, message) => {
   }
 
   if (json?.pkt_type !== 'scan_report' || !json?.data?.dev_infos || !Array.isArray(json.data.dev_infos)) 
-{
+  {
     return; // ignore non-scan-report messages
   }
 
@@ -162,6 +185,10 @@ client.on('message', async (topic, message) => {
     const srpRaw = dev?.srp_raw;
 
     if (!mac) continue;
+    if (!shouldForwardMac(mac)) {
+      log.debug({ mac }, 'Skipped (not in whitelist)');
+      continue;
+    }
 
     const { temperature, battery } = parseReadingFromRaw(advRaw, srpRaw);
 
