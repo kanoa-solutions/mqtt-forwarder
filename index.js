@@ -16,6 +16,8 @@ const {
   SUPABASE_AUTH,
   LOG_LEVEL = 'info',
   BEACON_WHITELIST, // optional bootstrap list (comma-separated normalized MACs)
+  SEND_INTERVAL_SECONDS = '60', // throttle interval per beacon
+  MIN_TEMP_DELTA = '0.3',       // immediate forward if change >= delta (in °C)
 } = process.env;
 
 // Robust log level handling with fallback to 'info'
@@ -29,6 +31,9 @@ if (!MQTT_HOST || !MQTT_USERNAME || !MQTT_PASSWORD || !SUPABASE_FUNCTION_URL || 
   process.exit(1);
 }
 
+const SEND_INTERVAL_MS = Math.max(0, Number(SEND_INTERVAL_SECONDS)) * 1000;
+const TEMP_DELTA = Math.max(0, Number(MIN_TEMP_DELTA));
+
 // Normalization and allowlist helpers
 const normalizeMac = (mac) => String(mac || '').toLowerCase().replace(/:/g, '');
 const envWhitelist = new Set(
@@ -38,6 +43,9 @@ const envWhitelist = new Set(
     .filter(Boolean)
 );
 let allowlistSet = new Set(envWhitelist); // will be replaced by DB sync when available
+
+// Per-beacon throttle state
+const lastSentByBeacon = new Map(); // normMac -> { tsMs: number, temp: number }
 
 // Derive Supabase REST base from the Edge Function URL
 const REST_BASE = (() => {
@@ -75,6 +83,24 @@ function shouldForwardMac(rawMac) {
   return allowlistSet.has(norm);
 }
 
+function shouldSendNow(rawMac, temperature) {
+  const norm = normalizeMac(rawMac);
+  const now = Date.now();
+  const prev = lastSentByBeacon.get(norm);
+  if (!prev) return true;
+  const age = now - prev.tsMs;
+  const delta = typeof temperature === 'number' && typeof prev.temp === 'number'
+    ? Math.abs(temperature - prev.temp)
+    : 0;
+  if (delta >= TEMP_DELTA) return true;
+  return age >= SEND_INTERVAL_MS;
+}
+
+function markSent(rawMac, temperature) {
+  const norm = normalizeMac(rawMac);
+  lastSentByBeacon.set(norm, { tsMs: Date.now(), temp: temperature });
+}
+
 // Initial sync and periodic refresh
 (async () => {
   await syncAllowlistFromDB();
@@ -104,6 +130,7 @@ client.on('connect', () => {
       if (allowlistSet.size > 0) {
         log.info({ size: allowlistSet.size }, 'Beacon allowlist active');
       }
+      log.info({ SEND_INTERVAL_SECONDS: Number(SEND_INTERVAL_SECONDS), MIN_TEMP_DELTA: TEMP_DELTA }, 'Throttle configured');
     }
   });
 });
@@ -199,6 +226,10 @@ client.on('message', async (topic, message) => {
       typeof json.temp_c === 'number' ? json.temp_c : undefined;
 
     if (typeof temperature === 'number') {
+      if (!shouldSendNow(json.beacon_mac, temperature)) {
+        log.debug({ mac: json.beacon_mac }, 'Throttled');
+        return;
+      }
       const body = {
         mac_address: json.beacon_mac,
         temperature,
@@ -208,6 +239,7 @@ client.on('message', async (topic, message) => {
         pdv_id: json.pdv_id,
       };
       await forwardToSupabase(body);
+      markSent(json.beacon_mac, temperature);
       log.info({ gwMac }, 'Forwarded simplified reading to Supabase');
     } else {
       log.debug({ json }, 'Simplified payload missing numeric temperature');
@@ -237,6 +269,10 @@ client.on('message', async (topic, message) => {
     const { temperature, battery } = parseReadingFromRaw(advRaw, srpRaw);
 
     if (typeof temperature === 'number') {
+      if (!shouldSendNow(mac, temperature)) {
+        log.debug({ mac }, 'Throttled');
+        continue;
+      }
       const body = {
         mac_address: mac,
         temperature,
@@ -244,6 +280,7 @@ client.on('message', async (topic, message) => {
         gateway_mac: gwMac
       };
       await forwardToSupabase(body);
+      markSent(mac, temperature);
       forwarded += 1;
     }
   }
