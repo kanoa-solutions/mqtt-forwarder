@@ -16,8 +16,8 @@ const {
   SUPABASE_AUTH,
   LOG_LEVEL = 'info',
   BEACON_WHITELIST, // optional bootstrap list (comma-separated normalized MACs)
-  SEND_INTERVAL_SECONDS = '60', // throttle interval per beacon
-  MIN_TEMP_DELTA = '0.3',       // immediate forward if change >= delta (in °C)
+  SEND_INTERVAL_SECONDS = '300', // default 5 minutes
+  MIN_TEMP_DELTA = '1000',       // default effectively disables delta-bypass
 } = process.env;
 
 // Robust log level handling with fallback to 'info'
